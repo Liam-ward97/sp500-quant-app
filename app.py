@@ -1,7 +1,7 @@
 """
 S&P 500 Live Quant Analyzer - PRO EDITION (Diagnostic)
 """
-import streamlit as st
+import stnp.random.choicereamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -378,7 +378,7 @@ def diversify_picks(df, max_per_sector=3):
 st.title("📈 Quant Signals Pro")
 st.caption("Full S&P 500 multi-factor scanner — diagnostic mode")
 
-with st.expander("⚙️ Settings", expanded=True):  # expanded by default
+with st.expander("⚙️ Settings", expanded=True):
     scan_size = st.radio(
         "Scan Size",
         ["Sample 30 (quick test, 15s)",
@@ -387,17 +387,24 @@ with st.expander("⚙️ Settings", expanded=True):  # expanded by default
          "Custom"],
         index=0
     )
+    
+    _all_tickers = get_sp500_tickers()
+    
     if scan_size == "Custom":
         custom = st.text_area("Tickers (comma-separated)", "AAPL,MSFT,NVDA")
         tickers_to_scan = [t.strip().upper() for t in custom.split(",")]
     elif scan_size.startswith("Full"):
-        tickers_to_scan = get_sp500_tickers()
+        tickers_to_scan = _all_tickers
     elif "100" in scan_size:
-        np.random.seed(42)  # reproducible for testing
-        tickers_to_scan = list(np.random.choice(get_sp500_tickers(), 100, replace=False))
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(_all_tickers), size=min(100, len(_all_tickers)), replace=False)
+        tickers_to_scan = [_all_tickers[i] for i in idx]
     else:
-        np.random.seed(42)
-        tickers_to_scan = list(np.random.choice(get_sp500_tickers(), 30, replace=False))
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(_all_tickers), size=min(30, len(_all_tickers)), replace=False)
+        tickers_to_scan = [_all_tickers[i] for i in idx]
+
+    st.caption(f"Will scan {len(tickers_to_scan)} tickers")
 
     st.markdown("---")
     min_score = st.slider("Min |score| to display in Top Picks", 0.0, 8.0, 0.0, 0.5)
