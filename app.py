@@ -1,3 +1,374 @@
+"""
+S&P 500 Live Quant Analyzer - PRO EDITION (Diagnostic)
+"""
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+import plotly.graph_objects as go
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+st.set_page_config(
+    page_title="Quant Signals Pro",
+    page_icon="📈",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
+
+st.markdown("""
+<style>
+    .block-container { padding-top: 1rem; padding-bottom: 2rem; max-width: 100%; }
+    .stButton button { height: 3rem; font-size: 1.1rem; font-weight: 600; border-radius: 12px; }
+    .signal-card {
+        background: #1E2128; border-radius: 12px; padding: 1rem;
+        margin: 0.5rem 0; border-left: 4px solid #00D26A;
+    }
+    .sell-card { border-left-color: #FF4B4B !important; }
+    #MainMenu, footer, header { visibility: hidden; }
+    [data-testid="stMetricValue"] { font-size: 1.3rem; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- UNIVERSE ----------
+@st.cache_data(ttl=86400)
+def get_sp500_tickers():
+    try:
+        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        return sorted(table["Symbol"].str.replace(".", "-", regex=False).tolist())
+    except Exception:
+        return ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","JPM","V","WMT"]
+
+@st.cache_data(ttl=86400)
+def get_sector_map():
+    try:
+        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        table["Symbol"] = table["Symbol"].str.replace(".", "-", regex=False)
+        return dict(zip(table["Symbol"], table["GICS Sector"]))
+    except Exception:
+        return {}
+
+# ---------- DATA ----------
+@st.cache_data(ttl=300)
+def fetch_data(ticker, period="6mo"):
+    try:
+        df = yf.download(ticker, period=period, interval="1d",
+                         progress=False, auto_adjust=True, threads=False)
+        if df.empty or len(df) < 60:
+            return None, f"insufficient_data({len(df)} rows)"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df, "ok"
+    except Exception as e:
+        return None, f"fetch_error({str(e)[:50]})"
+
+@st.cache_data(ttl=300)
+def fetch_benchmark():
+    df, _ = fetch_data("SPY")
+    return df
+
+# ---------- FACTORS ----------
+def compute_all_factors(df, spy_df=None):
+    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+
+    df["EMA9"]  = ta.trend.ema_indicator(c, 9)
+    df["EMA21"] = ta.trend.ema_indicator(c, 21)
+    df["SMA50"] = ta.trend.sma_indicator(c, 50)
+    sma200_win = min(200, len(c)-1)
+    df["SMA200"] = ta.trend.sma_indicator(c, sma200_win)
+    df["ADX"]   = ta.trend.adx(h, l, c, 14)
+
+    df["RSI"]   = ta.momentum.rsi(c, 14)
+    macd = ta.trend.MACD(c)
+    df["MACD"]  = macd.macd()
+    df["MACDh"] = macd.macd_diff()
+    df["ROC10"] = ta.momentum.roc(c, 10)
+
+    bb = ta.volatility.BollingerBands(c, 20, 2)
+    df["BB_H"] = bb.bollinger_hband()
+    df["BB_L"] = bb.bollinger_lband()
+    df["BB_pct"] = bb.bollinger_pband()
+    df["Zscore"] = (c - c.rolling(20).mean()) / c.rolling(20).std()
+
+    df["ATR"] = ta.volatility.average_true_range(h, l, c, 14)
+    df["ATR_pct"] = df["ATR"] / c * 100
+    df["Ret1"] = c.pct_change()
+
+    df["VOL_MA20"] = v.rolling(20).mean()
+    df["VOL_ratio"] = v / df["VOL_MA20"]
+    df["OBV"] = ta.volume.on_balance_volume(c, v)
+    df["OBV_slope"] = df["OBV"].diff(10)
+    df["MFI"] = ta.volume.money_flow_index(h, l, c, v, 14)
+
+    df["High20"] = h.rolling(20).max()
+    df["Low20"] = l.rolling(20).min()
+    high52_win = min(252, len(h)-1)
+    df["High52w"] = h.rolling(high52_win).max()
+    df["Low52w"] = l.rolling(high52_win).min()
+    df["PctFromHigh52w"] = (c / df["High52w"] - 1) * 100
+    df["PctFromLow52w"] = (c / df["Low52w"] - 1) * 100
+
+    df["Ret5"] = c.pct_change(5)
+    df["Ret20"] = c.pct_change(20)
+
+    if spy_df is not None and len(spy_df) > 0:
+        spy_close = spy_df["Close"].reindex(df.index).ffill()
+        try:
+            df["RS"] = (c / spy_close) / (c.iloc[0] / spy_close.iloc[0])
+            df["RS_slope"] = df["RS"].diff(10)
+        except Exception:
+            df["RS_slope"] = 0
+    else:
+        df["RS_slope"] = 0
+
+    df["Sharpe20"] = (df["Ret1"].rolling(20).mean() / df["Ret1"].rolling(20).std()) * np.sqrt(252)
+
+    return df.dropna()
+
+def score_stock(df, spy_df=None):
+    if df is None or len(df) < 50:
+        return None, "insufficient_rows"
+
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else last
+    except Exception as e:
+        return None, f"index_error({e})"
+
+    factors = {}
+    reasons = []
+
+    # TREND
+    ts = 0
+    if last["EMA9"] > last["EMA21"] > last["SMA50"]:
+        ts += 3; reasons.append("Full bull alignment")
+    elif last["EMA9"] < last["EMA21"] < last["SMA50"]:
+        ts -= 3; reasons.append("Full bear alignment")
+    elif last["EMA9"] > last["EMA21"]:
+        ts += 1
+    else:
+        ts -= 1
+
+    if not pd.isna(last["SMA200"]):
+        if last["Close"] > last["SMA200"]: ts += 2
+        else: ts -= 2
+
+    if last["ADX"] > 25:
+        ts += 2 if ts > 0 else -2
+        reasons.append(f"Strong trend ADX{last['ADX']:.0f}")
+    elif last["ADX"] < 20:
+        ts *= 0.5
+    factors["trend"] = ts
+
+    # MOMENTUM
+    ms = 0
+    if last["MACDh"] > 0 and prev["MACDh"] <= 0:
+        ms += 4; reasons.append("MACD bull cross")
+    elif last["MACDh"] < 0 and prev["MACDh"] >= 0:
+        ms -= 4; reasons.append("MACD bear cross")
+    elif last["MACDh"] > 0: ms += 1
+    else: ms -= 1
+
+    if last["ROC10"] > 5: ms += 2
+    elif last["ROC10"] > 2: ms += 1
+    elif last["ROC10"] < -5: ms -= 2
+    elif last["ROC10"] < -2: ms -= 1
+
+    if last["Ret5"] > 0.05: ms += 1
+    elif last["Ret5"] < -0.05: ms -= 1
+    factors["momentum"] = ms
+
+    # MEAN REVERSION
+    mrs = 0
+    rsi = last["RSI"]
+    if rsi <= 25: mrs += 3; reasons.append(f"Oversold RSI{rsi:.0f}")
+    elif rsi <= 35: mrs += 1
+    elif rsi >= 75: mrs -= 3; reasons.append(f"Overbought RSI{rsi:.0f}")
+    elif rsi >= 65: mrs -= 1
+
+    z = last["Zscore"]
+    if z < -2: mrs += 2; reasons.append(f"Z{z:.1f}")
+    elif z < -1.5: mrs += 1
+    elif z > 2: mrs -= 2; reasons.append(f"Z{z:.1f}")
+    elif z > 1.5: mrs -= 1
+
+    if last["BB_pct"] < 0.05: mrs += 2
+    elif last["BB_pct"] > 0.95: mrs -= 2
+    factors["mean_rev"] = mrs
+
+    # VOLUME
+    vs = 0
+    if last["VOL_ratio"] > 2.0:
+        if last["Ret1"] > 0: vs += 3; reasons.append("Bull volume 2x+")
+        else: vs -= 3; reasons.append("Bear volume 2x+")
+    elif last["VOL_ratio"] > 1.5:
+        vs += 2 if last["Ret1"] > 0 else -2
+
+    if last["OBV_slope"] > 0 and last["Ret20"] > 0: vs += 1
+    elif last["OBV_slope"] < 0 and last["Ret20"] < 0: vs -= 1
+
+    mfi = last["MFI"]
+    if mfi < 20: vs += 2
+    elif mfi > 80: vs -= 2
+    factors["volume"] = vs
+
+    # BREAKOUT
+    bos = 0
+    if last["Close"] >= last["High20"] * 0.99:
+        bos += 2; reasons.append("At 20d high")
+    elif last["Close"] <= last["Low20"] * 1.01:
+        bos -= 2; reasons.append("At 20d low")
+
+    if last["PctFromHigh52w"] > -5:
+        bos += 2; reasons.append("Near 52wH")
+    elif last["PctFromLow52w"] < 10:
+        bos -= 1
+    factors["breakout"] = bos
+
+    # RELATIVE STRENGTH
+    rss = 0
+    if not pd.isna(last.get("RS_slope", np.nan)):
+        if last["RS_slope"] > 0.02: rss += 2; reasons.append("Beats SPY")
+        elif last["RS_slope"] > 0: rss += 1
+        elif last["RS_slope"] < -0.02: rss -= 2
+        else: rss -= 1
+    factors["rel_strength"] = rss
+
+    # RISK-ADJUSTED
+    ras = 0
+    sh = last.get("Sharpe20", 0)
+    if not pd.isna(sh):
+        if sh > 1.5: ras += 2
+        elif sh > 0.5: ras += 1
+        elif sh < -1: ras -= 2
+        elif sh < -0.3: ras -= 1
+    factors["risk_adj"] = ras
+
+    weights = {"trend":0.25,"momentum":0.20,"mean_rev":0.15,"volume":0.15,
+               "breakout":0.10,"rel_strength":0.10,"risk_adj":0.05}
+    for k in factors:
+        factors[k] = max(-10, min(10, factors[k]))
+    composite = round(sum(factors[k]*weights[k] for k in factors), 2)
+
+    avg_dollar_vol = float(last["Close"] * last["VOL_MA20"])
+
+    return {
+        "score": composite,
+        "factors": factors,
+        "reasons": reasons,
+        "price": float(last["Close"]),
+        "rsi": float(last["RSI"]),
+        "adx": float(last["ADX"]),
+        "atr": float(last["ATR"]),
+        "zscore": float(last["Zscore"]),
+        "vol_ratio": float(last["VOL_ratio"]),
+        "mfi": float(last["MFI"]),
+        "ret5": float(last["Ret5"]),
+        "ret20": float(last["Ret20"]),
+        "pct_from_52w_high": float(last["PctFromHigh52w"]),
+        "sharpe20": float(sh) if not pd.isna(sh) else 0,
+        "dollar_vol_m": avg_dollar_vol / 1_000_000,
+    }, "ok"
+
+def recommendation(score, adx):
+    if adx > 30: hm = 1.3
+    elif adx < 20: hm = 0.6
+    else: hm = 1.0
+
+    if score >= 5:  return "STRONG BUY", f"{int(3*hm)}-{int(10*hm)}d", "🟢"
+    if score >= 3:  return "BUY", f"{int(2*hm)}-{int(7*hm)}d", "🟢"
+    if score >= 1.5:return "WEAK BUY", f"{int(1*hm)}-{int(3*hm)}d", "🟡"
+    if score > -1.5:return "HOLD", "Wait", "⚪"
+    if score > -3:  return "WEAK SELL", f"{int(1*hm)}-{int(3*hm)}d", "🟡"
+    if score > -5:  return "SELL", f"{int(2*hm)}-{int(7*hm)}d", "🔴"
+    return "STRONG SELL", f"{int(3*hm)}-{int(10*hm)}d", "🔴"
+
+def compute_targets(price, atr, score):
+    tmult = 2.5 + min(abs(score), 5) * 0.3
+    if score > 0:
+        stop = price - 1.5*atr; target = price + tmult*atr
+    else:
+        stop = price + 1.5*atr; target = price - tmult*atr
+    rr = abs(target-price)/abs(price-stop) if price != stop else 0
+    return stop, target, rr
+
+def analyze_ticker(ticker, spy_df, sector_map):
+    df, fetch_status = fetch_data(ticker)
+    if df is None:
+        return None, ticker, fetch_status
+
+    try:
+        df = compute_all_factors(df, spy_df)
+        if df.empty:
+            return None, ticker, "empty_after_factors"
+        s, score_status = score_stock(df, spy_df)
+        if s is None:
+            return None, ticker, score_status
+
+        action, hold, emoji = recommendation(s["score"], s["adx"])
+        stop, target, rr = compute_targets(s["price"], s["atr"], s["score"])
+
+        return {
+            "Ticker": ticker,
+            "Sector": sector_map.get(ticker, "Unknown"),
+            "Signal": action, "Emoji": emoji,
+            "Score": s["score"],
+            "Price": round(s["price"], 2),
+            "Stop": round(stop, 2),
+            "Target": round(target, 2),
+            "R:R": round(rr, 2),
+            "Hold": hold,
+            "RSI": round(s["rsi"], 1),
+            "ADX": round(s["adx"], 1),
+            "Z-Score": round(s["zscore"], 2),
+            "MFI": round(s["mfi"], 1),
+            "Vol Ratio": round(s["vol_ratio"], 2),
+            "5D%": round(s["ret5"]*100, 2),
+            "20D%": round(s["ret20"]*100, 2),
+            "From 52w High%": round(s["pct_from_52w_high"], 1),
+            "Sharpe": round(s["sharpe20"], 2),
+            "$Vol (M)": round(s["dollar_vol_m"], 1),
+            "Trend F": round(s["factors"]["trend"], 1),
+            "Mom F": round(s["factors"]["momentum"], 1),
+            "MR F": round(s["factors"]["mean_rev"], 1),
+            "Vol F": round(s["factors"]["volume"], 1),
+            "BO F": round(s["factors"]["breakout"], 1),
+            "RS F": round(s["factors"]["rel_strength"], 1),
+            "Reasons": " • ".join(s["reasons"][:4]),
+            "_df": df
+        }, ticker, "ok"
+    except Exception as e:
+        return None, ticker, f"analysis_error({str(e)[:60]})"
+
+def run_full_scan(tickers, spy_df, sector_map, max_workers=20):
+    results = []
+    errors = []
+    prog = st.progress(0, text="Initializing scan...")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(analyze_ticker, t, spy_df, sector_map): t for t in tickers}
+        for i, f in enumerate(as_completed(futures)):
+            r, tkr, status = f.result()
+            if r:
+                results.append(r)
+            else:
+                errors.append({"Ticker": tkr, "Reason": status})
+            prog.progress((i+1)/len(tickers),
+                         text=f"Scanning {i+1}/{len(tickers)} - {len(results)} valid, {len(errors)} errors")
+    prog.empty()
+    return pd.DataFrame(results), pd.DataFrame(errors)
+
+def diversify_picks(df, max_per_sector=3):
+    diversified = []
+    sector_count = {}
+    for _, row in df.iterrows():
+        sec = row["Sector"]
+        if sector_count.get(sec, 0) < max_per_sector:
+            diversified.append(row)
+            sector_count[sec] = sector_count.get(sec, 0) + 1
+    return pd.DataFrame(diversified)
 
 # ==========================================================
 # UI
